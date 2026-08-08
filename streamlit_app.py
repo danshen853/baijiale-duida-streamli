@@ -7,9 +7,18 @@ from collections import Counter, defaultdict
 from functools import lru_cache
 import hashlib
 import io
+import traceback
+from itertools import combinations
+from datetime import datetime
+from openpyxl.styles import Font, Alignment
+import zipfile
 import warnings
 import time
 warnings.filterwarnings('ignore')
+
+# Tạo logger
+logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO)   # nếu muốn hiển thị log ra console
 
 # 设置页面
 st.set_page_config(
@@ -237,34 +246,52 @@ class BaccaratDataProcessor:
         return 0, 0
     
     def validate_data_quality(self, df):
-        """数据质量验证"""
+        """数据质量验证 (đã sửa để tránh lỗi DataFrame không có .str)"""
         logger.info("正在进行数据质量验证...")
         issues = []
-        
-        # 检查必要列
+    
+     # Hàm helper an toàn lấy Series từ tên cột
+        def get_series(df, col_name):
+            s = df[col_name]
+            if isinstance(s, pd.DataFrame):
+                s = s.iloc[:, 0]   # lấy cột đầu nếu bị trùng
+            return s
+    
+    # Kiểm tra cột thiếu
         missing_cols = [col for col in self.required_columns if col not in df.columns]
         if missing_cols:
             issues.append(f"缺少必要列: {missing_cols}")
-        
-        # 检查空值
+    
+    # Kiểm tra null cho từng cột (dùng helper)
         for col in self.required_columns:
             if col in df.columns:
-                null_count = df[col].isnull().sum()
+                s = get_series(df, col)
+                null_count = s.isnull().sum()
                 if null_count > 0:
                     issues.append(f"列 '{col}' 有 {null_count} 个空值")
-        
-        # 检查重复数据
+    
+    # Kiểm tra dữ liệu trùng lặp
         duplicate_count = df.duplicated().sum()
         if duplicate_count > 0:
-            issues.append(f"发现 {duplicate_count} 条重复记录")
-        
-        # 检查游戏类型有效性
+             issues.append(f"发现 {duplicate_count} 条重复记录")
+    
+    # Kiểm tra game type không hợp lệ (SỬA DÙNG HELPER)
         if '游戏类型' in df.columns:
-            invalid_game_types = df[~df['游戏类型'].astype(str).str.contains('|'.join(['百家乐', '龙虎', 'Baccarat', 'Dragon']), na=False)]
-            if len(invalid_game_types) > 0:
-                issues.append(f"发现 {len(invalid_game_types)} 条非百家乐/龙虎游戏记录")
-        
+            s_game = get_series(df, '游戏类型')
+            # Chuyển sang str và kiểm tra chứa từ khóa
+            s_game_str = s_game.astype(str)
+            condition = s_game_str.str.contains('|'.join(['百家乐', '龙虎', 'Baccarat', 'Dragon']), na=False)
+            invalid_count = (~condition).sum()
+            if invalid_count > 0:
+                issues.append(f"发现 {invalid_count} 条非百家乐/龙虎游戏记录")
+    
         return issues
+    def get_series_safe(df, col_name):
+        """Trả về Series an toàn, nếu cột là DataFrame thì lấy cột đầu tiên"""
+        s = df[col_name]
+        if isinstance(s, pd.DataFrame):
+            s = s.iloc[:, 0]
+        return s
     
     def clean_data(self, uploaded_file):
         """数据清洗主函数 - 专为百家乐设计"""
@@ -318,7 +345,8 @@ class BaccaratDataProcessor:
             column_mapping = self.smart_column_identification(df_clean.columns)
             if column_mapping:
                 df_clean = df_clean.rename(columns=column_mapping)
-            
+                df_clean = df_clean.loc[:, ~df_clean.columns.duplicated()]
+            df_clean = df_clean.loc[:, ~df_clean.columns.duplicated()]
             # 如果仍有缺失列，尝试自动分配（更智能的映射）
             missing_columns = [col for col in self.required_columns if col not in df_clean.columns]
             if missing_columns:
@@ -335,6 +363,7 @@ class BaccaratDataProcessor:
                         df_clean = df_clean.rename(columns={col: '下注玩法'})
                     elif '金额' in col_lower or 'amount' in col_lower or '额度' in col_lower:
                         df_clean = df_clean.rename(columns={col: '下注额度'})
+
             
             # 再次检查必要列
             missing_columns = [col for col in self.required_columns if col not in df_clean.columns]
@@ -354,34 +383,54 @@ class BaccaratDataProcessor:
             for col in self.required_columns:
                 if col not in df_clean.columns:
                     df_clean[col] = ''
-            
+            # Hàm helper lấy Series an toàn (nếu là DataFrame thì lấy cột đầu)
+            def get_series_safe(df, col_name):
+                series_or_df = df[col_name]
+                if isinstance(series_or_df, pd.DataFrame):
+                   return series_or_df.iloc[:, 0]
+                return series_or_df
             # 数据格式化
             for col in self.required_columns:
-                df_clean[col] = df_clean[col].astype(str).str.strip()
+                if col in df_clean.columns:
+                     s = get_series_safe(df_clean, col)
+                     df_clean[col] = s.astype(str).str.strip()
             
             # 特殊处理局号列
             if '局号' in df_clean.columns:
-                df_clean['局号'] = df_clean['局号'].str.replace(r'\.0$', '', regex=True)
-                df_clean['局号'] = df_clean['局号'].str.replace(r'\s+', '', regex=True)
-            
+                s_juhao = get_series_safe(df_clean, '局号')
+                df_clean['局号'] = s_juhao.str.replace(r'\.0$', '', regex=True).str.replace(r'\s+', '', regex=True)
             # 处理金额列
             if '下注额度' in df_clean.columns:
-                df_clean['下注额度_原始'] = df_clean['下注额度']
-                df_clean['下注额度'] = df_clean['下注额度'].apply(self.preprocess_amount_column)
+                 s_amount = get_series_safe(df_clean, '下注额度')
+                 df_clean['下注额度_原始'] = s_amount
+                 df_clean['下注额度'] = s_amount.apply(self.preprocess_amount_column)
             
             # 验证数据质量
+            # Đảm bảo không còn cột nào là DataFrame (do trùng tên còn sót)
+            for col in df_clean.columns:
+                if isinstance(df_clean[col], pd.DataFrame):
+                    df_clean[col] = df_clean[col].iloc[:, 0]
             quality_issues = self.validate_data_quality(df_clean)
             if quality_issues:
                 logger.warning(f"数据质量问题: {quality_issues}")
-            
+
             # 过滤无效记录
+            # Lấy Series an toàn
+            s_account = get_series_safe(df_clean, '会员账号')
+            s_juhao   = get_series_safe(df_clean, '局号')
+            s_game    = get_series_safe(df_clean, '游戏类型')   
+            s_bet     = get_series_safe(df_clean, '下注玩法')       
             valid_mask = (
-                (df_clean['会员账号'].str.len() > 0) &
-                (df_clean['局号'].str.len() > 0) &
-                (df_clean['游戏类型'].str.len() > 0) &
-                (df_clean['下注玩法'].str.len() > 0)
+                (s_account.str.len() > 0) &
+                (s_juhao.str.len() > 0) &
+                (s_game.str.len() > 0) &
+                (s_bet.str.len() > 0)
             )
             df_clean = df_clean[valid_mask].copy()
+            for col in df_clean.columns:
+                if isinstance(df_clean[col], pd.DataFrame):
+                    df_clean[col] = df_clean[col].iloc[:, 0]
+
             
             logger.info(f"数据清洗完成: {initial_count} -> {len(df_clean)} 条记录")
             
@@ -573,9 +622,11 @@ class BaccaratWashTradeDetector:
         try:
             # 1. 标准化游戏类型
             if '游戏类型' in df_clean.columns:
-                df_clean['标准化游戏类型'] = df_clean['游戏类型'].apply(
-                    self.game_type_identifier.identify_game_type
-                )
+                def get_series_safe(df, col):
+                    s = df[col]
+                    return s.iloc[:, 0] if isinstance(s, pd.DataFrame) else s
+                s_game = get_series_safe(df_clean, '游戏类型')
+                df_clean['标准化游戏类型'] = s_game.apply(self.game_type_identifier.identify_game_type)
             else:
                 df_clean['标准化游戏类型'] = '未知'
             
